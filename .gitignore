@@ -1,0 +1,13 @@
+node_modules/
+.npm-cache/
+*.tgz
+*.log
+
+# 本机诊断留下的追踪输出，不入库
+.trace/
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

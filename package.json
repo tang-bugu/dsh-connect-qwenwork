@@ -1,0 +1,88 @@
+{
+  "name": "dsh-connect-qwenwork",
+  "displayName": "DSH Connect QwenWork",
+  "description": "把千问办公（QwenWork）接入 DeepSeek Harness：读取本机已登录的会话，在本机回环起一个 OpenAI 兼容桥，把 DSH 的模型请求翻译成千问办公的 ACP 对话协议。支持从桌面客户端/浏览器 Cookie 库自动恢复登录态、手填 Cookie 兜底，并提供 doctor 诊断。",
+  "version": "0.1.0",
+  "author": "dsh-connect-qwenwork",
+  "license": "MIT",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "qwenwork",
+    "千问办公",
+    "qwen",
+    "model-provider",
+    "acp"
+  ],
+  "type": "module",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "main": "src/index.js",
+  "icon": "icons/dsh-connect-qwenwork-128.png",
+  "bin": {
+    "dsh-connect-qwenwork": "src/bin.js"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./lib/client.js",
+    "./auth": "./src/auth.js",
+    "./acp": "./src/acp.js",
+    "./bridge": "./src/bridge.js",
+    "./sqlite": "./src/sqlite.js",
+    "./wsclient": "./src/wsclient.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "lib",
+    "icons",
+    "locale",
+    "docs",
+    "tools",
+    "test/fixtures/stubs",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node src/wsclient.test.mjs && node src/sqlite.test.mjs && node src/bridge.test.mjs && node src/acp.test.mjs && node src/e2e.test.mjs && node src/auth.test.mjs && node src/host.test.mjs && node src/card.test.mjs && node src/cli.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-settings-plugins",
+        "@deepseek-ai/dsh-client-locale"
+      ],
+      "platform": "web"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tang-bugu/dsh-connect-qwenwork.git"
+  },
+  "homepage": "https://github.com/tang-bugu/dsh-connect-qwenwork#readme",
+  "bugs": {
+    "url": "https://github.com/tang-bugu/dsh-connect-qwenwork/issues"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "3.18.4"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.1-rc.1 <5.0.0",
+    "@deepseek-ai/dsh-llm": ">=0.1.7-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-llm-pi-ai": ">=0.1.7-rc.1 <0.3.0-0",
+    "@earendil-works/pi-ai": ">=0.85.0 <2.0.0"
+  }
+}

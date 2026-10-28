@@ -1,0 +1,5 @@
+{
+  "name": "@earendil-works/pi-ai",
+  "type": "module",
+  "exports": { ".": "./index.mjs", "./api/openai-completions.lazy": "./api/openai-completions.lazy.mjs" }
+}

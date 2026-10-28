@@ -1,0 +1,18 @@
+# 把本插件挂进 Cordis 树：注册 `qwenwork` 这个 model provider。
+#
+# 这一层是 **bundle 层**，由 profile 的 `dsh.profile.bundles` 里的条目名决定
+# 是否应用——也就是说，用户只要 `dsh plugin add` 装上本包，随包发布的这份
+# patch 就会自动生效，不需要再手改 profile 的 `cordis.patch.yml`。
+#
+# 历史：2026-10-26 这份文件曾是空的 `[]`，当时的结论是「bundle patch 层不被
+# 应用」。2026-10-28 用隔离的 $DSH_HOME 重测，`--dump-config` 里能看到本层
+# 的 `# == dsh-connect-qwenwork` 段，并且真起一次 web profile 后
+# `apply()` 走到了 `provider-registered`。真正的原因是空列表本身不含任何
+# patch，而不是这一层不生效——空 `[]` 与「层失效」在日志上长得一模一样，
+# 这是当时误判的来源。
+#
+# 与 profile 用户层重复声明同一个 id 是安全的：实测 Cordis 会去重，
+# `apply()` 只被调用一次，不会重复挂载。
+- insert:
+    - id: dsh-connect-qwenwork
+      name: dsh-connect-qwenwork

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-connect-qwenwork",
+    "description": "Connects QwenWork (千问办公) to DSH: reads the locally signed-in session, runs a loopback OpenAI-compatible bridge, and translates DSH model requests into QwenWork's ACP conversation protocol. The session is recovered from the desktop app or browser cookie store, with a pasted Cookie header as a fallback."
+  }
+}

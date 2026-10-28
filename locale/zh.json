@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-connect-qwenwork",
+    "description": "把千问办公（QwenWork）接入 DSH：读取本机已登录的会话，在本机回环起一个 OpenAI 兼容桥，把 DSH 的模型请求翻译成千问办公的 ACP 对话协议。支持从桌面客户端与浏览器的 Cookie 库自动恢复登录态，也可手填 Cookie 兜底。"
+  }
+}
