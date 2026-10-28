@@ -1,0 +1,99 @@
+name: release
+
+# 发布由 tag 驱动：推 `v*` 标签 -> 跑测试 -> 发布 npm -> 建 GitHub Release。
+#
+# 为什么用 tag 而不是「每次 push 到 main 就发」：
+# npm 的版本号一旦发布就不可覆盖，而 main 上的提交并不都对应一个可发布版本。
+# 每次 push 都发意味着必须自动 bump 版本号，那会让版本号与 git 历史失去一一
+# 对应关系——出问题时无法说清「哪个 commit 是哪个版本」。tag 是显式的意图声明，
+# 也是 npm 上那个版本的可追溯来源。
+#
+# 发布一个版本（日常操作）：
+#   npm run release          # 测试 -> bump patch -> 打 tag -> 推送
+# 或手动：
+#   npm version minor && git push --follow-tags
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # 允许在 Actions 页面重跑某次发布（例如 npm 发布成功但 Release 步骤失败）。
+  # 注意：手动触发必须选一个 **tag**，选分支会在第一道网关就失败——这是刻意的，
+  # 见下方「必须是 tag」那一步。
+  workflow_dispatch:
+
+permissions:
+  contents: write # 建 GitHub Release
+  id-token: write # npm provenance 的 OIDC 签名
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: 必须是 tag
+        # workflow_dispatch 从分支手动触发时，GITHUB_REF_NAME 是分支名（如 main），
+        # 拿它去和 version 比对必然失败，报错还会指向「版本不匹配」而不是
+        # 「你从分支触发了」——后者才是真原因。先把它说清楚。
+        run: |
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            echo "::error::This workflow publishes to npm and must run on a tag, but it was started on ${GITHUB_REF_TYPE} '${GITHUB_REF_NAME}'. Re-run it selecting a v* tag, or push a tag: git push --follow-tags"
+            exit 1
+          fi
+
+      # 本包的 141 个用例不依赖任何 npm 包：宿主提供的 4 个包由
+      # test/fixtures/stubs 里的桩替代，测试自己链接/拆除
+      # （tools/link-test-stubs.mjs）。所以这里**不跑 npm install**——
+      # 省掉一次网络依赖，也就没有「安装失败让发布莫名其妙变红」的可能。
+      - name: 版本与 tag 一致
+        # tag 必须与 package.json 的 version 一致：tag 决定触发，version 决定
+        # npm 上出现什么。两者脱节会发出一个没人要求的版本号，且不可撤销。
+        run: node scripts/check-version.mjs "${GITHUB_REF_NAME}"
+
+      - name: 单元测试（9 个套件 / 141 用例，不联网）
+        run: npm test
+
+  publish:
+    name: publish
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      # 用 NPM_TOKEN（Granular / Automation，带 bypass 2FA）发布。
+      #
+      # 为什么首次发布必须有 token：npm 的 trusted publishing（OIDC）要求先在
+      # npmjs.com 上把这个仓库与该工作流注册成「包的发布者」，而**新包尚不存在
+      # 时无法注册**——先有鸡还是先有蛋。包发布之后可以切到 OIDC 并删掉这个
+      # secret，见 docs/RELEASE-CI.md。
+      #
+      # `--provenance` 会生成 sigstore 签名的来源证明，需要上方的
+      # `id-token: write` 和 package.json 的 repository 字段（两者都满足）。
+      - name: 发布到 npm
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: 建 GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag

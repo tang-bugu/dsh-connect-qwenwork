@@ -48,7 +48,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node src/wsclient.test.mjs && node src/sqlite.test.mjs && node src/bridge.test.mjs && node src/acp.test.mjs && node src/e2e.test.mjs && node src/auth.test.mjs && node src/host.test.mjs && node src/card.test.mjs && node src/cli.test.mjs"
+    "test": "node src/wsclient.test.mjs && node src/sqlite.test.mjs && node src/bridge.test.mjs && node src/acp.test.mjs && node src/e2e.test.mjs && node src/auth.test.mjs && node src/host.test.mjs && node src/card.test.mjs && node src/cli.test.mjs",
+    "release": "npm run test && npm version patch && git push --follow-tags"
   },
   "dsh": {
     "bundle": {

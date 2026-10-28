@@ -256,6 +256,18 @@ npx dsh-connect-qwenwork status        # 只读，不联网
 
 ---
 
+## 发布
+
+发布由 **tag 驱动**：推一个 `v*` 标签，GitHub Actions 自动跑测试、发布 npm
+并建 Release。
+
+```bash
+npm run release        # 测试 -> bump patch -> 打 tag -> 推送
+```
+
+一次性的 secret 配置与完整说明见 [`docs/RELEASE-CI.md`](docs/RELEASE-CI.md)。
+合并代码不会发布——npm 的版本号一旦发布不可覆盖，所以「发布」必须是一次显式声明。
+
 ## 开发
 
 ```bash
@@ -263,7 +275,7 @@ cd dsh-connect-qwenwork
 npm test
 ```
 
-九个套件、**141** 个用例，全部不联网、不依赖 npm 包：
+九个套件、**141** 个用例，全部不联网、不依赖 npm 包。
 
 | 套件 | 用例 | 覆盖 |
 |---|---|---|
