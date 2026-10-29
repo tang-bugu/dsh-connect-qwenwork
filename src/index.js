@@ -102,6 +102,38 @@ export const QWENWORK_SETTINGS_NS = 'dsh-connect-qwenwork'
 export const QWENWORK_TOKEN_ENV = 'QWENWORK_TOKEN'
 
 /**
+ * 一次请求里允许上游「不说话」的最长时间（毫秒）。
+ *
+ * **这个字段曾经漏掉，代价是整个 provider 直接不可用。**
+ *
+ * 宿主（`@deepseek-ai/dsh-llm-pi-ai` 0.2.x）每次请求都会把
+ * `profile.streamIdleTimeoutMs` 原样交给 `idleWatchdog`，而后者会先断言它是
+ * 「正的有限数且不超过 2147483647」。宿主自己解析配置文件时会给缺省值填
+ * 300000，但本插件是**手工构造** profile 的（见 `apply()` 里的 `profile`），
+ * 绕过了那层解析——于是字段缺失时，请求在发出之前就失败，报：
+ *
+ *   idleWatchdog timeoutMs must be a positive finite number no greater than 2147483647
+ *
+ * 所以这里必须显式写上，并且与宿主默认值保持一致：改小会在上游的沙箱冷启动
+ * 阶段误判超时（实测一轮 15–17 秒），改大则失去看门狗的意义。
+ */
+export const QWENWORK_STREAM_IDLE_TIMEOUT_MS = 300_000
+
+/**
+ * 图片预算。
+ *
+ * 千问办公只收文本（图片会变成 `[image omitted: …]` 占位符），但这三个字段
+ * 同样会被宿主在请求路径上读取（`profile.requestImagePixelBudget` 等）。缺字段
+ * 时宿主拿到 `undefined`——只有当消息里真的带图片才会炸，属于"平时看不出、
+ * 关键时候才爆"的坑。取宿主自己的默认值即可。
+ */
+const REQUEST_IMAGE_BUDGETS = Object.freeze({
+  maxRequestImageBytes: 20_971_520,
+  requestImagePixelBudget: 4_194_304,
+  requestImageMaxBytes: 1_048_576,
+})
+
+/**
  * 读取宿主实际服务的设置命名空间。
  *
  * `ctx.fiber.entry` 由 Loader 注入（不是 Cordis 本身），在没有 Loader 条目
@@ -166,6 +198,8 @@ export function apply(ctx, config) {
     client: undefined,
     /** 桥的启动 promise；请求路径用它来 await，避免竞态。 */
     starting: undefined,
+    /** 正在进行的「重启桥」；并发点击共享同一次重启。 */
+    restarting: undefined,
     catalog: [...FALLBACK_MODELS],
     lastError: undefined,
     lastVerified: undefined,
@@ -285,6 +319,60 @@ export function apply(ctx, config) {
     return state.catalog
   }
 
+  /**
+   * 关掉桥及其上游会话。
+   *
+   * 顺序是刻意的：先把 `state.bridge` 摘掉，再 `close()`。否则 `close()` 期间
+   * 进来的请求会拿到一个"看着还在、其实正在拆"的桥，报出来的错误很难懂。
+   */
+  const closeBridge = async () => {
+    const previous = state.bridge
+    state.bridge = undefined
+    try {
+      state.client?.close()
+    } catch (error) {
+      log('acp client did not close cleanly', error)
+    }
+    state.client = undefined
+    if (previous !== undefined) {
+      try {
+        await previous.close?.()
+      } catch (error) {
+        // 关不干净不该阻止重开：端口通常仍然可用，真不可用时下次启动会报。
+        log('bridge did not close cleanly', error)
+      }
+    }
+  }
+
+  /**
+   * 重启桥。
+   *
+   * 存在的理由：桥持有上游会话与一份建连时读取的凭证。客户端重新登录、
+   * 上游主动断开、端口被别的进程占过又释放——这些都需要"关掉再起来"。没有
+   * 这个入口时，唯一的办法是重启整个 DSH，代价（丢掉正在跑的会话）太大。
+   *
+   * 并发调用共享同一次重启：连点两下不能起两个桥（第二个会抢不到端口，
+   * 反而把状态搞成"桥未就绪"）。
+   */
+  const restartBridge = () => {
+    if (state.restarting !== undefined) return state.restarting
+    state.restarting = (async () => {
+      trace('bridge-restart-requested')
+      await closeBridge()
+      const bridge = await ensureBridge()
+      await refreshCatalog().catch(() => state.catalog)
+      trace('bridge-restarted', { baseUrl: bridge.baseUrl, port: bridge.port })
+      return bridge
+    })().catch((error) => {
+      state.lastError = messageOf(error)
+      log('bridge restart failed', error)
+      throw error
+    }).finally(() => {
+      state.restarting = undefined
+    })
+    return state.restarting
+  }
+
   /** pi-ai 的模型描述。字段与 `dsh-connect-workbuddy` 的 `toPiModel` 对齐。 */
   const toPiModel = (model, baseUrl) => ({
     id: model.id,
@@ -373,12 +461,33 @@ export function apply(ctx, config) {
       getModels: () => buildModels(),
     }
 
+    /**
+     * 给 pi-ai 适配器看的 profile。
+     *
+     * 这个对象是**手工构造**的，不走宿主自己的配置解析器（`resolveProfiles`），
+     * 因此宿主会给缺省值补上的字段，这里必须自己填。宿主在请求路径上直接读
+     * `profile.streamIdleTimeoutMs` / `profile.requestImage*`，缺了就是
+     * `undefined`——`idleWatchdog` 会因此断言失败，整条 provider 在发出请求
+     * 之前就不可用（见 `QWENWORK_STREAM_IDLE_TIMEOUT_MS` 的注释）。
+     *
+     * 字段清单以 `@deepseek-ai/dsh-llm-pi-ai` 0.2.x 的实现为准：
+     *   displayName / streamIdleTimeoutMs / retryPolicy / configuredMaxTokens /
+     *   modelErrors / piProvider / 图片预算。
+     *
+     * 这里**故意不写** `reasoning`：它是 profile 的"默认思考档位"，必须是一个
+     * 档位 id（`off`/`low`/`high`…），而不是"本模型不支持思考"这个布尔。
+     * 写成 `false` 时宿主会拿它去 `resolveReasoningLevel` 比对，直接抛
+     * `does not support reasoning effort "false"`。"不支持思考"这件事只属于
+     * **模型描述**（`toPiModel` 里的 `reasoning: false`），不写进 profile。
+     */
     const profile = {
       provider: QWENWORK_PROVIDER,
       displayName: QWENWORK_PROVIDER_DISPLAY_NAME,
+      streamIdleTimeoutMs: QWENWORK_STREAM_IDLE_TIMEOUT_MS,
       retryPolicy: resolveRetryPolicy?.(undefined, 'dsh-connect-qwenwork retryPolicy'),
       configuredMaxTokens: new Map(),
       modelErrors: new Map(),
+      ...REQUEST_IMAGE_BUDGETS,
       piProvider: provider,
     }
 
@@ -480,6 +589,100 @@ export function apply(ctx, config) {
         }
       },
     }))
+
+    /**
+     * 设置卡片上的「重启桥」按钮的数据面。
+     *
+     * 这是插件里**唯一**一条会改变运行状态的路由，所以鉴权比只读那条更严：
+     *   1. 必须是 POST（GET 不该有副作用）；
+     *   2. 对端必须是回环（同 `isLoopbackRequest`）；
+     *   3. `Origin` 必须与 `Host` 同源。
+     *
+     * 第 3 条挡的是 CSRF：任意网页都能向 `127.0.0.1:<port>` 发一个"简单请求"
+     * （POST + text/plain，无预检），而它的对端确实是回环、`Host` 也确实写成了
+     * 回环地址——前两条拦不住。浏览器对 POST 一定带 `Origin`，比对同源即可。
+     *
+     * 返回值是一份**新的状态文档**，卡片直接拿来刷新，不必再发一次 GET。
+     */
+    ctx.effect(() => webServer.register({
+      kind: 'exact',
+      path: QWENWORK_RESTART_PATH,
+      handler: async (req, res) => {
+        if (req.method !== 'POST') {
+          writeJson(res, 405, { error: 'method not allowed' })
+          return
+        }
+        if (!isLoopbackRequest(req)) {
+          writeJson(res, 403, { error: 'origin-not-trusted' })
+          return
+        }
+        if (!isSameOriginRequest(req)) {
+          writeJson(res, 403, { error: 'cross-origin-rejected' })
+          return
+        }
+        try {
+          await restartBridge()
+          writeJson(res, 200, await buildStatusDocument(ctx, state, value, resolveCredential))
+        } catch (error) {
+          writeJson(res, 500, { error: messageOf(error) })
+        }
+      },
+    }))
+
+    /**
+     * 设置卡片上的「快捷重启」按钮的数据面：让 DSH **重新加载本插件**。
+     *
+     * 这就是以前必须"退出应用再打开"的那个动作。DSH 自带 HMR
+     * （`@deepseek-ai/dsh-hmr`）：它的 profile 重算会用磁盘上**已改动**的文件
+     * 替换正在运行的插件模块，不需要重启进程。所以卡片只要触发一次重算即可。
+     *
+     * 三个实现细节：
+     *
+     *   1. **先回话再重载**。重载会停掉本插件所在的 Loader 条目——这条路由也
+     *      属于它。等重载完成再写响应，就没有人接这个响应了。所以先 202，
+     *      再异步触发。
+     *   2. 没有 `hmr` 服务（headless / 没开 profileContext 的宿主）时明确报
+     *      503 并告诉用户去重启，而不是假装已经重启。
+     *   3. 重载失败只写 trace + 日志：这是后台动作，响应早发出去了，卡片
+     *      之后靠 `/status` 自己看结果。
+     */
+    ctx.effect(() => webServer.register({
+      kind: 'exact',
+      path: QWENWORK_RELOAD_PATH,
+      handler: async (req, res) => {
+        if (req.method !== 'POST') {
+          writeJson(res, 405, { error: 'method not allowed' })
+          return
+        }
+        if (!isLoopbackRequest(req)) {
+          writeJson(res, 403, { error: 'origin-not-trusted' })
+          return
+        }
+        if (!isSameOriginRequest(req)) {
+          writeJson(res, 403, { error: 'cross-origin-rejected' })
+          return
+        }
+        const hmr = typeof ctx.get === 'function' ? ctx.get('hmr') : undefined
+        if (hmr === undefined || typeof hmr.runExclusive !== 'function' || typeof hmr.reconcileProfile !== 'function') {
+          writeJson(res, 503, {
+            error: 'hot-reload-unavailable',
+            message: '这个 DSH 进程没有可用的热重载服务（hmr）。请退出并重新打开 DSH 来加载新代码。',
+          })
+          return
+        }
+        trace('plugin-reload-requested')
+        writeJson(res, 202, { reloading: true })
+        const timer = setTimeout(() => {
+          hmr.runExclusive(() => hmr.reconcileProfile())
+            .then((result) => trace('plugin-reload-finished', result ?? null))
+            .catch((error) => {
+              trace('plugin-reload-failed', { error: messageOf(error) })
+              log('plugin reload failed', error)
+            })
+        }, 250)
+        timer.unref?.()
+      },
+    }))
   })
 
   /**
@@ -514,6 +717,17 @@ export function apply(ctx, config) {
 
 /** 卡片读取登录态与桥状态的只读路由。 */
 export const QWENWORK_STATUS_PATH = '/plugins/dsh-connect-qwenwork/status'
+
+/** 卡片「重启桥」按钮写入的路由（POST，带副作用）。 */
+export const QWENWORK_RESTART_PATH = '/plugins/dsh-connect-qwenwork/restart'
+
+/**
+ * 卡片「快捷重启」按钮写入的路由（POST，带副作用）。
+ *
+ * 与 `/restart` 的区别：那条只重启**桥**（重连上游），这条让 DSH 重新加载
+ * **插件代码**——也就是"改完插件不用重启整个应用"的那个动作。
+ */
+export const QWENWORK_RELOAD_PATH = '/plugins/dsh-connect-qwenwork/reload'
 
 /**
  * 组装卡片要的那份文档。
@@ -582,6 +796,25 @@ export function isLoopbackRequest(req) {
   const host = String(req?.headers?.host ?? '')
   if (host.length === 0) return true
   return /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(host)
+}
+
+/**
+ * 请求是否与页面同源。
+ *
+ * 只对**会改变状态**的路由有意义：回环页面上的按钮与宿主同源，因此浏览器的
+ * `Origin` 恰好等于 `http://<Host>`。别的网页向回环地址发 POST 时，前两条检查
+ * （回环对端、回环 `Host`）都成立——`Host` 是浏览器写的目标地址，改不了——
+ * 但 `Origin` 是它自己的站点，于是这里就能拦住。
+ *
+ * 没有 `Origin` 时不拦：那不是浏览器发起的请求（curl / 本地脚本），CSRF 不是
+ * 威胁模型，而这些工具恰恰是诊断时要用 POST 手段的来源。
+ */
+export function isSameOriginRequest(req) {
+  const origin = req?.headers?.origin
+  if (typeof origin !== 'string' || origin.length === 0) return true
+  const host = String(req?.headers?.host ?? '')
+  if (host.length === 0) return false
+  return origin === `http://${host}` || origin === `https://${host}`
 }
 
 function writeJson(res, status, payload) {

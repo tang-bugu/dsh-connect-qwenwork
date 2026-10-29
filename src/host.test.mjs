@@ -37,7 +37,10 @@ try {
 }
 
 async function runTests() {
-  const { apply, name, inject, settingsNamespaceOf, Config, QWENWORK_PROVIDER } = await import('./index.js')
+  const {
+    apply, name, inject, settingsNamespaceOf, Config, QWENWORK_PROVIDER,
+    QWENWORK_RESTART_PATH, QWENWORK_RELOAD_PATH, QWENWORK_STATUS_PATH, QWENWORK_STREAM_IDLE_TIMEOUT_MS, isSameOriginRequest,
+  } = await import('./index.js')
 
   const results = []
   let failures = 0
@@ -62,8 +65,8 @@ async function runTests() {
  * `cleanups` 收集 `ctx.effect` 注册的拆除函数：每次 `apply()` 都会起一个
  * 回环桥，测试结束必须真的关掉它，否则端口与 socket 累积，进程不会退出。
  */
-function makeContext() {
-  const registered = { adapters: [], directory: [], discovery: [], settings: [], effects: [] }
+function makeContext(options = {}) {
+  const registered = { adapters: [], directory: [], discovery: [], settings: [], effects: [], routes: [] }
   const warnings = []
   const cleanups = []
   const context = {
@@ -72,6 +75,11 @@ function makeContext() {
       error: (message, error) => warnings.push({ message, error }),
     },
     fiber: { entry: { options: { id: 'dsh-connect-qwenwork' } } },
+    /**
+     * Cordis 的 `ctx.get(name)`。插件只用它取 `hmr` 服务——"快捷重启"
+     * 能不能用完全取决于这一项，所以测试要能分别给出"有"和"没有"。
+     */
+    get: (name) => (name === 'hmr' ? options.hmr : undefined),
     effect: (fn) => {
       registered.effects.push(fn)
       // Cordis 的 effect(fn) 返回 fn 的返回值作为 disposer；fn 本身是
@@ -113,10 +121,59 @@ function makeContext() {
           },
         })
       }
+      if (names.includes('webServer')) {
+        return fn({
+          ...context,
+          webServer: {
+            register: (route) => {
+              registered.routes.push(route)
+              return () => {}
+            },
+          },
+        })
+      }
       return fn(context)
     },
   }
   return { context, registered, warnings, cleanups }
+}
+
+/**
+ * 一个最小的 HTTP 响应替身。
+ *
+ * 路由处理器只需要 `writeHead(status, headers)` 与 `end(body)`：`writeJson`
+ * 就是这么写的。把它收到的东西原样交回，断言只看状态码与响应体。
+ */
+function fakeResponse() {
+  const captured = { status: undefined, headers: undefined, body: undefined }
+  const res = {
+    writeHead: (status, headers) => {
+      captured.status = status
+      captured.headers = headers
+    },
+    end: (body) => {
+      captured.body = body
+    },
+  }
+  return { res, captured }
+}
+
+/** 一个来自回环页面、与宿主同源的 POST 请求替身。 */
+function sameOriginPost(host = '127.0.0.1:7448') {
+  return {
+    method: 'POST',
+    socket: { remoteAddress: '127.0.0.1' },
+    headers: { host, origin: `http://${host}` },
+  }
+}
+
+/** 一个来自回环页面、但 Origin 是别的站点的 POST 请求替身（CSRF 形状）。 */
+function crossOriginPost(host = '127.0.0.1:7448') {
+  return {
+    method: 'POST',
+    socket: { remoteAddress: '127.0.0.1' },
+    headers: { host, origin: 'https://evil.example' },
+  }
 }
 
 /**
@@ -131,8 +188,8 @@ function makeContext() {
  * 的 effect 要到微任务之后才存在。所以这里先等 400ms 再交出去，且拆除时
  * 重新读一次 `cleanups`（它可能在那之后又长了）。
  */
-async function withPlugin(config = {}, body) {
-  const made = makeContext()
+async function withPlugin(config = {}, body, options = {}) {
+  const made = makeContext(options)
   const handle = apply(made.context, config)
   try {
     // 让惰性导入、桥的启动与 inject 回调里的 effect 注册都跑完。
@@ -251,6 +308,189 @@ await test('the config schema declares every field the code reads', () => {
   for (const field of ['token', 'enabled', 'defaultModelId', 'allowFallbackCatalog', 'desktopAuthDir']) {
     assert.ok(Config.properties[field] !== undefined, `missing schema field ${field}`)
   }
+})
+
+/* ------------------------------------------------------------------ *
+ * pi-ai 适配器契约
+ * ------------------------------------------------------------------ */
+
+await test('the pi-ai profile carries every field the host reads at request time', async () => {
+  await withPlugin({}, async ({ registered }) => {
+    const profiles = registered.adapters[0].adapter.config.profiles()
+    const profile = profiles.get(QWENWORK_PROVIDER)
+    assert.ok(profile !== undefined, 'the adapter must own the qwenwork route')
+
+    // 这一条钉的是真实故障：宿主在发请求之前把 `profile.streamIdleTimeoutMs`
+    // 交给 `idleWatchdog`，后者只接受「正的有限数且不超过 2^31-1」。插件是
+    // 手工构造 profile 的，漏了这个字段时整条 provider 在请求发出前就失败，
+    // 报 `idleWatchdog timeoutMs must be a positive finite number…`。
+    assert.equal(typeof profile.streamIdleTimeoutMs, 'number')
+    assert.equal(profile.streamIdleTimeoutMs, QWENWORK_STREAM_IDLE_TIMEOUT_MS)
+    assert.ok(profile.streamIdleTimeoutMs > 0 && profile.streamIdleTimeoutMs <= 2_147_483_647)
+
+    // 其余被宿主直接读取的字段：缺了不会立刻炸，但会在特定路径上变成
+    // `undefined`（例如消息里带图片时的预算、重试策略）。
+    assert.ok(profile.retryPolicy !== undefined, 'retryPolicy must be resolved before registration')
+    assert.ok(profile.configuredMaxTokens instanceof Map)
+    assert.ok(profile.modelErrors instanceof Map)
+    assert.ok(profile.piProvider !== undefined, 'the host builds its model table from piProvider')
+    // `profile.reasoning` 只能是档位 id（或干脆不写）：写成布尔 `false` 时宿主
+    // 会把它当档位去比对，抛 `does not support reasoning effort "false"`。
+    // "不支持思考"属于模型描述（`reasoning: false`），不属于 profile。
+    assert.ok(
+      profile.reasoning === undefined || typeof profile.reasoning === 'string',
+      'profile.reasoning must be a level id or absent',
+    )
+    for (const field of ['maxRequestImageBytes', 'requestImagePixelBudget', 'requestImageMaxBytes']) {
+      assert.ok(Number.isInteger(profile[field]) && profile[field] > 0, `${field} must be a positive integer`)
+    }
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * 重启桥
+ * ------------------------------------------------------------------ */
+
+await test('the restart path is namespaced next to the status path', () => {
+  assert.equal(QWENWORK_RESTART_PATH, '/plugins/dsh-connect-qwenwork/restart')
+  assert.notEqual(QWENWORK_RESTART_PATH, QWENWORK_STATUS_PATH)
+})
+
+await test('apply() registers both the status and the restart route', async () => {
+  await withPlugin({}, async ({ registered }) => {
+    const paths = registered.routes.map((route) => route.path)
+    assert.ok(paths.includes(QWENWORK_STATUS_PATH), `missing status route, got ${paths.join(',')}`)
+    assert.ok(paths.includes(QWENWORK_RESTART_PATH), `missing restart route, got ${paths.join(',')}`)
+  })
+})
+
+await test('the restart route rejects a GET and a cross-origin POST', async () => {
+  await withPlugin({}, async ({ registered }) => {
+    const route = registered.routes.find((item) => item.path === QWENWORK_RESTART_PATH)
+
+    const get = fakeResponse()
+    await route.handler(
+      { method: 'GET', socket: { remoteAddress: '127.0.0.1' }, headers: { host: '127.0.0.1:7448' } },
+      get.res,
+    )
+    assert.equal(get.captured.status, 405)
+
+    // 回环对端 + 回环 Host，但 Origin 是别的站点：前两条检查都会放过，
+    // 只有同源检查能拦住。这正是 CSRF 的形状。
+    const cross = fakeResponse()
+    await route.handler(crossOriginPost(), cross.res)
+    assert.equal(cross.captured.status, 403)
+    assert.match(cross.captured.body, /cross-origin/)
+
+    const remote = fakeResponse()
+    await route.handler({ ...sameOriginPost(), socket: { remoteAddress: '10.0.0.7' } }, remote.res)
+    assert.equal(remote.captured.status, 403)
+  })
+})
+
+await test('the restart route really re-opens the bridge and returns fresh status', async () => {
+  await withPlugin({}, async ({ registered, handle }) => {
+    const route = registered.routes.find((item) => item.path === QWENWORK_RESTART_PATH)
+    const before = handle.status().bridge
+    assert.ok(before !== undefined, 'the bridge must be running before the restart')
+
+    const io = fakeResponse()
+    await route.handler(sameOriginPost(), io.res)
+
+    assert.equal(io.captured.status, 200)
+    const document = JSON.parse(io.captured.body)
+    assert.equal(document.bridge.running, true)
+    assert.ok(document.bridge.port > 0)
+    assert.ok(Array.isArray(document.catalog) && document.catalog.length >= 4)
+
+    // 状态句柄也必须指向新桥：重启后仍有桥在监听（端口可能变，所以只断言存在）。
+    const after = handle.status().bridge
+    assert.ok(after !== undefined, 'the bridge must be running after the restart')
+    const health = await fetch(`http://127.0.0.1:${after.port}/healthz`)
+    assert.equal(health.status, 200)
+    await health.body?.cancel()
+  })
+})
+
+await test('isSameOriginRequest compares Origin against Host', () => {
+  assert.equal(isSameOriginRequest({ headers: { host: '127.0.0.1:7448', origin: 'http://127.0.0.1:7448' } }), true)
+  assert.equal(isSameOriginRequest({ headers: { host: '127.0.0.1:7448', origin: 'https://127.0.0.1:7448' } }), true)
+  assert.equal(isSameOriginRequest({ headers: { host: '127.0.0.1:7448', origin: 'https://evil.example' } }), false)
+  // 没有 Origin 的 POST：不是浏览器发的（curl / 本地脚本），放行。
+  assert.equal(isSameOriginRequest({ headers: { host: '127.0.0.1:7448' } }), true)
+  // 有 Origin 却读不到 Host：无从比对，拒。
+  assert.equal(isSameOriginRequest({ headers: { origin: 'http://127.0.0.1:7448' } }), false)
+})
+
+/* ------------------------------------------------------------------ *
+ * 快捷重启（让 DSH 重新加载插件）
+ * ------------------------------------------------------------------ */
+
+await test('the reload path is namespaced and distinct from the restart path', () => {
+  assert.equal(QWENWORK_RELOAD_PATH, '/plugins/dsh-connect-qwenwork/reload')
+  assert.notEqual(QWENWORK_RELOAD_PATH, QWENWORK_RESTART_PATH)
+})
+
+await test('apply() registers the reload route too', async () => {
+  await withPlugin({}, async ({ registered }) => {
+    const paths = registered.routes.map((route) => route.path)
+    assert.ok(paths.includes(QWENWORK_RELOAD_PATH), `missing reload route, got ${paths.join(',')}`)
+  })
+})
+
+await test('the reload route reports 503 when the host has no hmr service', async () => {
+  // headless / 没有 profileContext 的宿主就是这种情况：没有热重载，
+  // 必须明确告诉用户去重启，而不是回一个假的"已重启"。
+  await withPlugin({}, async ({ registered }) => {
+    const route = registered.routes.find((item) => item.path === QWENWORK_RELOAD_PATH)
+    const io = fakeResponse()
+    await route.handler(sameOriginPost(), io.res)
+    assert.equal(io.captured.status, 503)
+    assert.match(io.captured.body, /hot-reload-unavailable/)
+  })
+})
+
+await test('the reload route rejects a GET and a cross-origin POST', async () => {
+  await withPlugin({}, async ({ registered }) => {
+    const route = registered.routes.find((item) => item.path === QWENWORK_RELOAD_PATH)
+
+    const get = fakeResponse()
+    await route.handler({ method: 'GET', socket: { remoteAddress: '127.0.0.1' }, headers: { host: '127.0.0.1:7448' } }, get.res)
+    assert.equal(get.captured.status, 405)
+
+    const cross = fakeResponse()
+    await route.handler(crossOriginPost(), cross.res)
+    assert.equal(cross.captured.status, 403)
+  })
+})
+
+await test('the reload route answers 202 first and then recomposes the profile', async () => {
+  const calls = []
+  const hmr = {
+    runExclusive: async (operation) => {
+      calls.push('runExclusive')
+      return operation()
+    },
+    reconcileProfile: async () => {
+      calls.push('reconcileProfile')
+      return { pending: [], warnings: [] }
+    },
+  }
+
+  await withPlugin({}, async ({ registered }) => {
+    const route = registered.routes.find((item) => item.path === QWENWORK_RELOAD_PATH)
+    const io = fakeResponse()
+    await route.handler(sameOriginPost(), io.res)
+
+    // 先回话：重载会把这条路由所在的 Loader 条目停掉，等重载完成再写响应
+    // 就没有人接了。
+    assert.equal(io.captured.status, 202)
+    assert.match(io.captured.body, /reloading/)
+
+    // 重载是异步触发的（250ms 后），等它跑完再断言。
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    assert.deepEqual(calls, ['runExclusive', 'reconcileProfile'])
+  }, { hmr })
 })
 
 /* ------------------------------------------------------------------ */

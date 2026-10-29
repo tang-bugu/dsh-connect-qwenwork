@@ -50,6 +50,19 @@ WS     wss://qwenwork.cn/api/chat-ws      Authorization: Bearer <jwt>   → 101
 **结束判据**（最容易写错的地方）：`idle` 在本轮开始前也会来一条，单看"有没有
 idle"会把回复截断成空。判据必须是「**见过 `running` 或正文增量之后**的 idle」。
 
+**还有一条硬限制：一条消息最多 32768 字节。** 2026-10-29 实测，发一条 33000
+字节的 `new_prompt`，660 ms 后连接被对端以 `1009` 关闭，reason 是
+`read limited at 32769 bytes`（1009 = message too big）。上限按**未压缩**的
+消息字节数算——同一轮探测的载荷是几万个重复字符，permessage-deflate 能压到
+几百字节，照样被拒，所以**压缩救不了**。
+
+DSH 每轮都把整段对话发过来，而这个插件必须把它压成**一条** `new_prompt`，于是
+对话一长就会撞上限。处理办法在 `messagesToPrompt(messages, { maxBytes })`：
+超预算时保住系统提示与最新的消息，从最老的一侧开始整条丢弃，并在正文里留下
+`[上游单条消息上限 32 KB：已省略较早的 N 条消息…]` 的标记；最新那条如果自己
+就超了，则保留头尾各一段（结论常在尾部）。`acp.js` 发送前还有一道
+`fitPromptForUpstream()` 兜底，保证不会把 1009 变成用户看到的错误。
+
 ---
 
 ## 三层结构
@@ -170,6 +183,24 @@ Cordis 树真正读取的列表，手改 `node_modules` 不够。
 卡片上可以**手填 Bearer token**，写入 `token` 字段。留空并保存等于 `unset`
 （恢复自动读取），而不是写空串——后者会存一个"存在但为空"的覆盖层。
 
+卡片上还有两个**会改变运行状态**的按钮，分工是刻意分开的：
+
+| 按钮 | 走哪条路由 | 做什么 | 用在哪 |
+|---|---|---|---|
+| **快捷重启** | `POST /plugins/dsh-connect-qwenwork/reload` | 让 DSH **重新加载本插件**（插件代码、版本、桥全部重来） | 升级了插件、改了插件代码、刚更新过 `node_modules` |
+| **重启桥** | `POST /plugins/dsh-connect-qwenwork/restart` | 只关掉回环桥与上游会话再重开（重新读登录态、重连上游） | 客户端重新登录了、上游断了、桥卡住了 |
+
+「快捷重启」靠的是 DSH 自带的 HMR（`@deepseek-ai/dsh-hmr`）：它的 profile 重算
+会用磁盘上**已改动**的文件替换正在运行的插件模块，不需要重启进程——也就是
+以前"退出应用再打开"的那个动作。所以它是**先回 202 再异步触发**重载：重载会
+把这条路由所在的 Loader 条目一起停掉，等重载完成再写响应就没有人接了。宿主
+没有 `hmr` 服务（headless、没开 `profileContext`）时这条路明确回 503，并告诉
+用户去重启，而不是假装成功。
+
+两条路由都只收 `POST`，都要求回环对端，并且都要求 `Origin` 与 `Host` 同源——
+它们能停掉正在跑的会话里的请求，不该被任意网页触发（CSRF：同机任意网页都能
+向回环地址发 POST）。
+
 卡片本身**不接触任何 token**：它读 Host 的只读路由
 `/plugins/dsh-connect-qwenwork/status`，那份 JSON 只给来源、身份片段与字节数。
 
@@ -275,18 +306,18 @@ cd dsh-connect-qwenwork
 npm test
 ```
 
-九个套件、**141** 个用例，全部不联网、不依赖 npm 包。
+九个套件、**161** 个用例，全部不联网、不依赖 npm 包。
 
 | 套件 | 用例 | 覆盖 |
 |---|---|---|
 | `wsclient.test.mjs` | 13 | 握手、分片、控制帧、掩码、超大帧、UTF-8 校验 |
 | `sqlite.test.mjs` | 32 | 头部、序列类型、rowid、溢出页、损坏输入 |
 | `bridge.test.mjs` | 15 | token 鉴权、SSE 顺序、finish_reason、错误路径 |
-| `acp.test.mjs` | 23 | 控制信封、事件归一化、流式时序、遗留 idle、断线 |
+| `acp.test.mjs` | 30 | 控制信封、事件归一化、流式时序、遗留 idle、断线、32 KB 上限裁剪 |
 | `e2e.test.mjs` | 6 | 假会话上游 → 真客户端 → 真桥 → OpenAI 客户端 |
 | `auth.test.mjs` | 19 | Cookie 组头、主机匹配、路径、失败分类 |
-| `host.test.mjs` | 13 | `apply()` 的 provider 注册、目录、模型发现 |
-| `card.test.mjs` | 18 | 状态路由脱敏；`lib/client.js` 真实执行；字段名对账 |
+| `host.test.mjs` | 24 | `apply()` 的 provider 注册、pi-ai profile 契约、重启桥/快捷重启路由、目录、模型发现 |
+| `card.test.mjs` | 20 | 状态路由脱敏；`lib/client.js` 真实执行；字段名/路径对账 |
 | `cli.test.mjs` | 2 | CLI 模块顶层求值、help 里的子命令与实现对账 |
 
 两个值得单独说的：

@@ -2,7 +2,7 @@
   "name": "dsh-connect-qwenwork",
   "displayName": "DSH Connect QwenWork",
   "description": "把千问办公（QwenWork）接入 DeepSeek Harness：读取本机已登录的会话，在本机回环起一个 OpenAI 兼容桥，把 DSH 的模型请求翻译成千问办公的 ACP 对话协议。支持从桌面客户端/浏览器 Cookie 库自动恢复登录态、手填 Cookie 兜底，并提供 doctor 诊断。",
-  "version": "0.1.2",
+  "version": "0.1.4",
   "author": "dsh-connect-qwenwork",
   "license": "MIT",
   "keywords": [

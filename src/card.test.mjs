@@ -101,6 +101,22 @@ await test('the status path is namespaced under /plugins/<plugin>/', () => {
   assert.equal(QWENWORK_STATUS_PATH, '/plugins/dsh-connect-qwenwork/status')
 })
 
+await test('the card calls the restart path the Host actually registers, with POST', async () => {
+  // 与本文件后面两条"字段名对账"同一个道理：路径是卡片与 Host 之间唯一的
+  // 字符串契约。写错路径时卡片照样渲染，点下去只得到 404——没有任何提示。
+  const source = readFileSync(join(pluginRoot, 'lib', 'client.js'), 'utf8')
+  const { QWENWORK_RESTART_PATH } = await import('./index.js')
+  assert.ok(source.includes(QWENWORK_RESTART_PATH), `lib/client.js never calls ${QWENWORK_RESTART_PATH}`)
+  // 重启是有副作用的动作，Host 那条路由只收 POST；GET 会被 405 拒掉。
+  assert.match(source, /method:\s*'POST'/, 'the restart request must be a POST')
+})
+
+await test('the card calls the reload path the Host actually registers', async () => {
+  const source = readFileSync(join(pluginRoot, 'lib', 'client.js'), 'utf8')
+  const { QWENWORK_RELOAD_PATH } = await import('./index.js')
+  assert.ok(source.includes(QWENWORK_RELOAD_PATH), `lib/client.js never calls ${QWENWORK_RELOAD_PATH}`)
+})
+
 await test('the status document reports the bridge and the catalog', async () => {
   const inputs = fakeInputs()
   const document = await buildStatusDocument(inputs.ctx, inputs.state, inputs.value, inputs.resolveCredential)

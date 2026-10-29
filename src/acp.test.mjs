@@ -14,10 +14,13 @@ import { EventEmitter } from 'node:events'
 
 import {
   CONTROL,
+  clipPromptText,
   controlEnvelope,
   contentToText,
   finishReasonOf,
+  fitPromptForUpstream,
   messagesToPrompt,
+  newPromptFrameBytes,
   normalizeUpdate,
   promptParams,
   QwenWorkAcpClient,
@@ -267,6 +270,80 @@ await test('promptParams only carries text blocks', () => {
   const params = promptParams('sess-1', 'hello')
   assert.equal(params.sessionId, 'sess-1')
   assert.deepEqual(params.prompt, [{ type: 'text', text: 'hello' }])
+})
+
+/* ------------------------------------------------------------------ *
+ * 上游 32 KB 单条消息上限
+ *
+ * 2026-10-29 实测：33000 字节的 new_prompt 会让对端以 1009 关闭连接，
+ * reason 是 `read limited at 32769 bytes`。DSH 的对话会无限长，而插件把整段
+ * 历史压成一条消息，所以"放不下"是常态，必须主动裁剪。
+ * ------------------------------------------------------------------ */
+
+await test('newPromptFrameBytes measures the encoded frame, not the text', () => {
+  const plain = newPromptFrameBytes('sess-1', 'a'.repeat(1000))
+  const quoted = newPromptFrameBytes('sess-1', '"'.repeat(1000))
+  // 1000 个引号在 JSON 里会变成 2000 字节——上限按线上字节算，不是按字符数。
+  assert.ok(quoted > plain)
+  assert.ok(newPromptFrameBytes('sess-1', '') > 0, 'the envelope itself has a size')
+})
+
+await test('clipPromptText keeps both ends and reports what it dropped', () => {
+  const text = `HEAD-${'x'.repeat(4000)}-TAIL`
+  const clipped = clipPromptText(text, 1000)
+  assert.ok(Buffer.byteLength(clipped.text, 'utf8') <= 1000)
+  assert.match(clipped.text, /^HEAD-/)
+  assert.match(clipped.text, /-TAIL$/)
+  assert.match(clipped.text, /省略/)
+  assert.ok(clipped.omittedBytes > 3000)
+})
+
+await test('clipPromptText leaves short text untouched', () => {
+  const clipped = clipPromptText('short', 1000)
+  assert.equal(clipped.text, 'short')
+  assert.equal(clipped.omittedBytes, 0)
+})
+
+await test('fitPromptForUpstream always lands under the frame limit', () => {
+  const limit = 8 * 1024
+  const text = `${'开头'.repeat(2000)}${'补'.repeat(20000)}${'结尾'.repeat(500)}`
+  const fitted = fitPromptForUpstream('sess-1', text, 1, limit)
+  assert.ok(newPromptFrameBytes('sess-1', fitted.text) <= limit, 'the fitted frame must fit')
+  assert.ok(fitted.omittedBytes > 0)
+  // 头尾都要留：系统提示在头，结论在尾。
+  assert.match(fitted.text, /^开头/)
+  assert.match(fitted.text, /结尾$/)
+})
+
+await test('fitPromptForUpstream does not touch a prompt that already fits', () => {
+  const fitted = fitPromptForUpstream('sess-1', 'hello', 1, 8 * 1024)
+  assert.equal(fitted.text, 'hello')
+  assert.equal(fitted.omittedBytes, 0)
+})
+
+await test('messagesToPrompt drops the oldest turns first when over budget', () => {
+  const prompt = messagesToPrompt([
+    { role: 'system', content: 'SYSTEM-PROMPT' },
+    { role: 'user', content: `OLD-${'a'.repeat(4000)}` },
+    { role: 'assistant', content: `MID-${'b'.repeat(2000)}` },
+    { role: 'user', content: 'NEWEST-QUESTION' },
+  ], { maxBytes: 3000 })
+  assert.ok(Buffer.byteLength(prompt, 'utf8') <= 3000, `over budget: ${Buffer.byteLength(prompt, 'utf8')}`)
+  // 系统提示与最新一条必须在；最老的整条被丢掉。
+  assert.match(prompt, /SYSTEM-PROMPT/)
+  assert.match(prompt, /NEWEST-QUESTION/)
+  assert.doesNotMatch(prompt, /OLD-/)
+  assert.match(prompt, /省略较早的/)
+})
+
+await test('messagesToPrompt clips a single oversized newest turn instead of dropping it', () => {
+  const prompt = messagesToPrompt([
+    { role: 'system', content: 'SYSTEM-PROMPT' },
+    { role: 'user', content: `HUGE-${'z'.repeat(9000)}-TAIL` },
+  ], { maxBytes: 3000 })
+  assert.ok(Buffer.byteLength(prompt, 'utf8') <= 3000)
+  assert.match(prompt, /HUGE-/)
+  assert.match(prompt, /TAIL/)
 })
 
 await test('normalizeUpdate keeps agent text and drops the user echo', () => {

@@ -30,7 +30,18 @@ import {
   finishReasonOf,
   QwenWorkAcpClient,
   messagesToPrompt,
+  UPSTREAM_MESSAGE_LIMIT_BYTES,
 } from './acp.js'
+
+/**
+ * 拼 prompt 时的字节预算。
+ *
+ * 上游一条消息只收 32 KB（实测，见 `UPSTREAM_MESSAGE_LIMIT_BYTES`）。这里再
+ * 提前留出 2 KB 给 JSON-RPC 外壳、sessionId 与转义，让 `acp.js` 的兜底几乎
+ * 不会触发——真正裁消息的逻辑放在 `messagesToPrompt` 里，因为它知道哪条是
+ * 系统提示、哪条最新，能按"系统提示 + 最近上下文"的顺序丢。
+ */
+export const PROMPT_BUDGET_BYTES = UPSTREAM_MESSAGE_LIMIT_BYTES - 2 * 1024
 
 /** 桥只监听这个地址。改成 `0.0.0.0` 会把用户的登录态暴露给局域网。 */
 export const BIND_ADDRESS = '127.0.0.1'
@@ -307,7 +318,7 @@ async function readJsonBody(request) {
  */
 async function handleCompletions(request, response, body, context) {
   const messages = Array.isArray(body.messages) ? body.messages : []
-  const prompt = messagesToPrompt(messages)
+  const prompt = messagesToPrompt(messages, { maxBytes: PROMPT_BUDGET_BYTES })
   if (prompt.trim().length === 0) {
     writeJson(response, 400, {
       error: { message: 'no user-visible text in messages', type: 'invalid_request_error' },

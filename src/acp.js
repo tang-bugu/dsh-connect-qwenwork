@@ -127,6 +127,26 @@ export const IDLE_GRACE_MS = 60
 /** 等 `idle` 的超时；比总超时短一点，好先报"卡住了"而不是"超时了"。 */
 export const IDLE_TIMEOUT_MS = 14 * 60 * 1000
 
+/**
+ * 上游 WS 一条消息的硬上限：32768 字节。
+ *
+ * 实测（2026-10-29）：发一条 **33000 字节**的 `new_prompt`，660 ms 后连接被
+ * 对端以 `1009` 关闭，reason 是 `read limited at 32769 bytes`。1009 就是
+ * "message too big"，32769 = 32768 + 1——对端读到上限就掐断，不是网络抖动。
+ *
+ * 两个容易踩错的细节：
+ *
+ *   1. 上限按**未压缩的消息字节数**算。同一轮探测的载荷是几万个重复字符
+ *      （permessage-deflate 能压到几百字节），照样被拒——所以"开压缩"救不了。
+ *   2. 它限制的是**一条消息**，不是一轮对话。而本插件把整段对话压成一条
+ *      `new_prompt`，于是 DSH 的会话一长（系统提示 + 历史），每条请求都会
+ *      撞上它，报出来的就是上面那句 1009。
+ */
+export const UPSTREAM_MESSAGE_LIMIT_BYTES = 32 * 1024
+
+/** 给 JSON-RPC 外壳、sessionId 与 JSON 转义留的余量。 */
+export const PROMPT_FRAME_RESERVE_BYTES = 512
+
 /** 上游 `stopReason` → OpenAI `finish_reason`。 */
 export function finishReasonOf(stopReason) {
   switch (stopReason) {
@@ -158,6 +178,86 @@ export function promptParams(sessionId, text) {
   return { sessionId, prompt: [{ type: 'text', text }] }
 }
 
+/** 这一条 `new_prompt` 在线上会占多少字节（转义后的 JSON，正是对端数的那些）。 */
+export function newPromptFrameBytes(sessionId, text, id = 1) {
+  return Buffer.byteLength(
+    JSON.stringify(controlEnvelope(CONTROL.NEW_PROMPT, promptParams(sessionId, text), id)),
+    'utf8',
+  )
+}
+
+/** 按 UTF-8 字节数取头部，不切出半个字符。 */
+function utf8Head(buffer, maxBytes) {
+  let end = Math.max(0, Math.min(maxBytes, buffer.length))
+  while (end > 0 && (buffer[end] & 0xc0) === 0x80) end -= 1
+  return buffer.subarray(0, end).toString('utf8')
+}
+
+/** 按 UTF-8 字节数取尾部，不切出半个字符。 */
+function utf8Tail(buffer, maxBytes) {
+  let start = Math.max(0, buffer.length - Math.max(0, maxBytes))
+  while (start < buffer.length && (buffer[start] & 0xc0) === 0x80) start += 1
+  return buffer.subarray(start).toString('utf8')
+}
+
+/** 截断标记本身要占的字节数（给二分留出空间）。 */
+const CLIP_MARKER_BYTES = 160
+
+/**
+ * 把一段文本裁到 `maxBytes` 字节以内，保留**头尾两端**。
+ *
+ * 保留头尾而不是只留头部：一段太长而必须裁掉的东西，既可能是"开头就说清楚的
+ * 指令"，也可能是"结尾才给出的结论"（工具结果的最后一行往往就是答案）。
+ * 只留一头在另一头上会静默丢信息。
+ */
+export function clipPromptText(text, maxBytes) {
+  const buffer = Buffer.from(text, 'utf8')
+  if (buffer.length <= maxBytes) return { text, omittedBytes: 0 }
+
+  const budget = Math.max(0, maxBytes - CLIP_MARKER_BYTES)
+  const headBytes = Math.floor(budget * 0.6)
+  const tailBytes = budget - headBytes
+  const head = utf8Head(buffer, headBytes)
+  const tail = utf8Tail(buffer, tailBytes)
+  const omittedBytes = buffer.length - Buffer.byteLength(head, 'utf8') - Buffer.byteLength(tail, 'utf8')
+  const marker = `\n\n…[内容过长：中间省略约 ${Math.round(omittedBytes / 1024)} KB（上游单条消息上限 ${Math.round(UPSTREAM_MESSAGE_LIMIT_BYTES / 1024)} KB）]…\n\n`
+  return { text: `${head}${marker}${tail}`, omittedBytes }
+}
+
+/**
+ * 让一条 prompt 一定能塞进上游的单条消息上限。
+ *
+ * 为什么要有这一层：上限是**对端**的，超了只会得到一个 1009，用户看到的是
+ * "websocket closed"，完全无法行动。这里宁可让模型少看一段，也要让这一轮
+ * 能发出去——并且在正文里留下省略标记，模型能自己知道信息不全。
+ *
+ * 用二分找"能塞进去的最大文本"，因为 JSON 转义让字节数不是线性的
+ * （换行、引号会膨胀），估算不如直接量。
+ */
+export function fitPromptForUpstream(
+  sessionId,
+  text,
+  id = 1,
+  limit = UPSTREAM_MESSAGE_LIMIT_BYTES - PROMPT_FRAME_RESERVE_BYTES,
+) {
+  if (newPromptFrameBytes(sessionId, text, id) <= limit) return { text, omittedBytes: 0 }
+  const totalBytes = Buffer.byteLength(text, 'utf8')
+  let low = 0
+  let high = totalBytes
+  let best = { text: clipPromptText(text, 0).text, omittedBytes: totalBytes }
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2)
+    const candidate = clipPromptText(text, mid)
+    if (newPromptFrameBytes(sessionId, candidate.text, id) <= limit) {
+      best = candidate
+      low = mid + 1
+    } else {
+      high = mid - 1
+    }
+  }
+  return best
+}
+
 /**
  * 把 DSH 的 `messages` 压成一条 prompt 文本。
  *
@@ -166,28 +266,85 @@ export function promptParams(sessionId, text) {
  *
  * 保留角色与工具痕迹——丢掉它们模型就看不懂上下文里的工具结果。但**不**
  * 伪装成多轮结构（那需要复用同一个上游会话，见 `prompt()` 的说明）。
+ *
+ * `options.maxBytes` 是消息体预算。上游一条消息只给 32 KB（见
+ * `UPSTREAM_MESSAGE_LIMIT_BYTES`），而 DSH 的对话会无限长——所以超预算时的
+ * 取舍顺序是**固定的**：系统提示（"你是谁、怎么说话"）优先，其次是最新的
+ * 消息，最老的一侧先丢，并在中间留一条省略标记。
  */
-export function messagesToPrompt(messages) {
-  const parts = []
+export function messagesToPrompt(messages, options = {}) {
+  const maxBytes = options.maxBytes ?? Infinity
+  const rendered = []
   for (const message of messages ?? []) {
     const role = String(message?.role ?? 'user')
     const text = contentToText(message?.content)
     if (text.length === 0) continue
-    if (role === 'system' || role === 'developer') {
-      parts.push(text)
-      continue
-    }
-    if (role === 'assistant') {
-      parts.push(`Assistant: ${text}`)
-      continue
-    }
-    if (role === 'tool') {
-      parts.push(`Tool result: ${text}`)
-      continue
-    }
-    parts.push(text)
+    rendered.push({ role, text })
   }
-  return parts.join('\n\n')
+  if (rendered.length === 0) return ''
+  const joined = rendered.map(segmentText).join('\n\n')
+  if (Buffer.byteLength(joined, 'utf8') <= maxBytes) return joined
+  return fitSegments(rendered, maxBytes)
+}
+
+/** 一条消息在 prompt 里的样子：角色前缀 + 正文。 */
+function segmentText(segment) {
+  const { role, text } = segment
+  if (role === 'system' || role === 'developer') return text
+  if (role === 'assistant') return `Assistant: ${text}`
+  if (role === 'tool') return `Tool result: ${text}`
+  return text
+}
+
+const SEGMENT_SEPARATOR_BYTES = 2
+
+/**
+ * 超预算时的拼装：保住系统提示与最近的消息。
+ *
+ * 只在 `messagesToPrompt` 判定超预算后调用，所以这里可以放心地把"丢消息"
+ * 当作正常路径——每一轮都可能丢，这是上游的硬限制，不是错误。
+ */
+function fitSegments(rendered, maxBytes) {
+  const isSystem = (segment) => segment.role === 'system' || segment.role === 'developer'
+  const systems = rendered.filter(isSystem)
+  const others = rendered.filter((segment) => !isSystem(segment))
+
+  // 系统提示是"你是谁"，丢了整轮都会跑偏；但也给它一半的上限封顶，
+  // 否则一个超长的系统提示会把整段对话挤没。
+  let systemText = systems.map(segmentText).join('\n\n')
+  const systemCap = Math.floor(maxBytes * 0.5)
+  if (Buffer.byteLength(systemText, 'utf8') > systemCap) {
+    systemText = clipPromptText(systemText, systemCap).text
+  }
+
+  let remaining = Math.max(0, maxBytes - Buffer.byteLength(systemText, 'utf8')
+    - (systemText.length > 0 ? SEGMENT_SEPARATOR_BYTES : 0))
+  const kept = []
+  let omitted = 0
+
+  for (let index = others.length - 1; index >= 0; index -= 1) {
+    const text = segmentText(others[index])
+    const size = Buffer.byteLength(text, 'utf8') + SEGMENT_SEPARATOR_BYTES
+    if (size <= remaining) {
+      kept.unshift(text)
+      remaining -= size
+      continue
+    }
+    // 最新的那条不能整条丢：宁可裁掉一半，也要让模型看到这一轮的要求。
+    if (kept.length === 0 && remaining > CLIP_MARKER_BYTES * 2) {
+      kept.unshift(clipPromptText(text, remaining - SEGMENT_SEPARATOR_BYTES).text)
+      omitted += index
+      remaining = 0
+      break
+    }
+    omitted += index + 1
+    break
+  }
+
+  const marker = omitted > 0
+    ? `[上游单条消息上限 ${Math.round(UPSTREAM_MESSAGE_LIMIT_BYTES / 1024)} KB：已省略较早的 ${omitted} 条消息，以下是剩余的最近上下文]`
+    : ''
+  return [systemText, marker, ...kept].filter((part) => part.length > 0).join('\n\n')
 }
 
 /** 把一个 content 数组/字符串折成纯文本。 */
@@ -697,9 +854,21 @@ export class QwenWorkAcpClient extends EventEmitter {
        * 所以：把请求的落定值接进一个 promise（不阻塞生成器），同时开始
        * 消费队列。队列的结束由 onControl/onUpdate/onClosed/超时驱动。
        */
+      /**
+       * 发之前把体积压到上游上限以内。
+       *
+       * 桥已经按预算拼过 prompt 了，这里是第二道网：任何绕过桥的调用方
+       * （doctor、测试、以后新增的入口）也不该把 1009 变成用户的问题。
+       * 省略的字节数写进 trace，方便事后判断"是不是又撞上限了"。
+       */
+      const fitted = fitPromptForUpstream(sessionId, text)
+      if (fitted.omittedBytes > 0) {
+        this.options.log?.(`prompt 超上游上限，已省略 ${fitted.omittedBytes} 字节（上限 ${UPSTREAM_MESSAGE_LIMIT_BYTES} 字节/条）`)
+      }
+
       const settled = this.request(
         CONTROL.NEW_PROMPT,
-        promptParams(sessionId, text),
+        promptParams(sessionId, fitted.text),
         signal,
         PROMPT_TIMEOUT_MS,
       ).then(
